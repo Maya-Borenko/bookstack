@@ -8,7 +8,6 @@ on:
 jobs:
   sync-to-bookstack:
     runs-on: ubuntu-latest
-    # ИЗМЕНИЛИ: используем contains() вместо ==
     if: contains(github.event.issue.labels.*.name, 'knowledge-base')
     steps:
       - name: Debug - Show Labels
@@ -23,29 +22,33 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v3
 
-      - name: Setup Node
-        uses: actions/setup-node@v3
-        with:
-          node-version: '18'
-
-      - name: Install dependencies
+      - name: Setup Node and install dependencies
         run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
           npm install marked
-          sudo apt-get update && sudo apt-get install -y jq
 
       - name: Generate HTML from Markdown
         id: generate_html
         run: |
-          echo "ISSUE_BODY<<EOF" >> $GITHUB_ENV
-          echo "${{ github.event.issue.body }}" >> $GITHUB_ENV
+          # Сохраняем тело issue в файл
+          echo "${{ github.event.issue.body }}" > issue_body.md
+          
+          # Генерируем HTML
+          HTML_CONTENT=$(node -e "
+            const { marked } = require('marked');
+            const fs = require('fs');
+            const issueBody = fs.readFileSync('issue_body.md', 'utf8');
+            const html = marked.parse(issueBody);
+            console.log(html);
+          ")
+          
+          # Сохраняем в переменную вывода
+          echo "html_content<<EOF" >> $GITHUB_ENV
+          echo "$HTML_CONTENT" >> $GITHUB_ENV
           echo "EOF" >> $GITHUB_ENV
           
-          node -e "
-            const { marked } = require('marked');
-            const issueBody = process.env.ISSUE_BODY || '';
-            const html = marked.parse(issueBody);
-            console.log('HTML_CONTENT=' + encodeURIComponent(html));
-          " >> $GITHUB_ENV
+          echo "HTML сгенерирован (длина: ${#HTML_CONTENT} символов)"
 
       - name: Get Book ID for "Githab Issues"
         id: get_book_id
@@ -58,40 +61,49 @@ jobs:
           
           # Получаем список всех книг
           response=$(curl -s -X GET "$BOOKSTACK_URL/api/books" \
-            -H "Authorization: Token $API_ID:$API_SECRET")
+            -H "Authorization: Token $API_ID:$API_SECRET" \
+            -H "Accept: application/json")
           
-          echo "API Response: $response"
+          echo "API Response received"
           
           # Ищем книгу по имени
-          book_id=$(echo $response | jq -r '.data[] | select(.name == "Githab Issues") | .id')
+          book_id=$(echo "$response" | jq -r '.data[] | select(.name == "Githab Issues") | .id')
           
-          if [ -z "$book_id" ]; then
+          if [ -z "$book_id" ] || [ "$book_id" = "null" ]; then
             echo "❌ Книга 'Githab Issues' не найдена!"
             echo "Создаем новую книгу..."
             
             create_response=$(curl -s -X POST "$BOOKSTACK_URL/api/books" \
               -H "Authorization: Token $API_ID:$API_SECRET" \
               -H "Content-Type: application/json" \
+              -H "Accept: application/json" \
               -d '{
                 "name": "Githab Issues",
                 "description": "GitHub Issues synchronized via KCS"
               }')
             
-            book_id=$(echo $create_response | jq -r '.id')
+            book_id=$(echo "$create_response" | jq -r '.id')
+            
+            if [ -z "$book_id" ] || [ "$book_id" = "null" ]; then
+              echo "❌ Ошибка при создании книги: $create_response"
+              exit 1
+            fi
+            
             echo "✅ Создана новая книга с ID: $book_id"
           else
             echo "✅ Найдена книга 'Githab Issues' с ID: $book_id"
           fi
           
-          echo "BOOK_ID=$book_id" >> $GITHUB_OUTPUT
+          echo "book_id=$book_id" >> $GITHUB_OUTPUT
 
       - name: Create or Update BookStack Page
         env:
           API_ID: ${{ secrets.BOOKSTACK_API_ID }}
           API_SECRET: ${{ secrets.BOOKSTACK_API_SECRET }}
           BOOKSTACK_URL: ${{ secrets.BOOKSTACK_URL }}
+          HTML_CONTENT: ${{ env.html_content }}
         run: |
-          BOOK_ID=${{ steps.get_book_id.outputs.BOOK_ID }}
+          BOOK_ID="${{ steps.get_book_id.outputs.book_id }}"
           
           echo "Используем Book ID: $BOOK_ID"
           
@@ -104,46 +116,92 @@ jobs:
             STATUS="🔄 В работе"
           fi
           
-          # Формируем контент
-          CONTENT="<p><strong>GitHub Issue:</strong> <a href='${{ github.event.issue.html_url }}'>#${{ github.event.issue.number }}</a></p>"
-          CONTENT="$CONTENT<div>$HTML_CONTENT</div>"
-          CONTENT="$CONTENT<p><strong>Статус:</strong> $STATUS</p>"
+          # Формируем полный контент
+          FULL_CONTENT="<p><strong>GitHub Issue:</strong> <a href='${{ github.event.issue.html_url }}'>#${{ github.event.issue.number }}</a></p>"
+          FULL_CONTENT="${FULL_CONTENT}<div>${HTML_CONTENT}</div>"
+          FULL_CONTENT="${FULL_CONTENT}<p><strong>Статус:</strong> $STATUS</p>"
           
           echo "Ищем существующую страницу..."
           
-          EXISTING_PAGE=$(curl -s -X GET "$BOOKSTACK_URL/api/pages?book_id=$BOOK_ID" \
-          -H "Authorization: Token $API_ID:$API_SECRET" \
-          | jq -r ".data[] | select(.name == \"${{ github.event.issue.title }}\") | .id")
+          # Используем curl с правильными заголовками
+          EXISTING_PAGE_RESPONSE=$(curl -s -X GET "$BOOKSTACK_URL/api/pages?book_id=$BOOK_ID" \
+            -H "Authorization: Token $API_ID:$API_SECRET" \
+            -H "Accept: application/json")
           
-          if [ -z "$EXISTING_PAGE" ]; then
-            echo "Создаем новую страницу: ${{ github.event.issue.title }}"
+          EXISTING_PAGE=$(echo "$EXISTING_PAGE_RESPONSE" | jq -r ".data[] | select(.name == \"${{ github.event.issue.title }}\") | .id")
+          
+          # Создаем JSON данные
+          PAGE_TITLE="${{ github.event.issue.title }}"
+          
+          if [ -z "$EXISTING_PAGE" ] || [ "$EXISTING_PAGE" = "null" ]; then
+            echo "Создаем новую страницу: $PAGE_TITLE"
             
-            # Экранируем кавычки для JSON
-            ESCAPED_CONTENT=$(echo "$CONTENT" | sed 's/"/\\"/g')
+            # Создаем JSON с использованием jq
+            JSON_DATA=$(jq -n \
+              --arg name "$PAGE_TITLE" \
+              --argjson book_id "$BOOK_ID" \
+              --arg html "$FULL_CONTENT" \
+              '{
+                "name": $name,
+                "book_id": $book_id,
+                "html": $html,
+                "tags": [
+                  {"name": "github", "value": "issue-${{ github.event.issue.number }}"},
+                  {"name": "source", "value": "github-actions"}
+                ]
+              }')
             
-            curl -X POST "$BOOKSTACK_URL/api/pages" \
+            echo "Отправляемые данные: $JSON_DATA"
+            
+            RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "$BOOKSTACK_URL/api/pages" \
               -H "Authorization: Token $API_ID:$API_SECRET" \
               -H "Content-Type: application/json" \
-              -d "{
-                \"name\": \"${{ github.event.issue.title }}\",
-                \"book_id\": $BOOK_ID,
-                \"html\": \"$ESCAPED_CONTENT\",
-                \"tags\": [
-                  {\"name\": \"github\", \"value\": \"issue-${{ github.event.issue.number }}\"},
-                  {\"name\": \"source\", \"value\": \"github-actions\"}
-                ]
-              }" && echo "✅ Страница создана успешно" || echo "❌ Ошибка при создании"
+              -H "Accept: application/json" \
+              -d "$JSON_DATA")
+            
+            HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+            BODY=$(echo "$RESPONSE" | sed '$d')
+            
+            echo "HTTP Code: $HTTP_CODE"
+            echo "Response: $BODY"
+            
+            if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+              echo "✅ Страница создана успешно"
+            else
+              echo "❌ Ошибка при создании страницы"
+              exit 1
+            fi
+            
           else
             echo "Обновляем существующую страницу ID: $EXISTING_PAGE"
             
-            # Экранируем кавычки для JSON
-            ESCAPED_CONTENT=$(echo "$CONTENT" | sed 's/"/\\"/g')
+            # Создаем JSON для обновления
+            JSON_DATA=$(jq -n \
+              --arg name "$PAGE_TITLE" \
+              --arg html "$FULL_CONTENT" \
+              '{
+                "name": $name,
+                "html": $html
+              }')
             
-            curl -X PUT "$BOOKSTACK_URL/api/pages/$EXISTING_PAGE" \
+            echo "Отправляемые данные: $JSON_DATA"
+            
+            RESPONSE=$(curl -s -w "\n%{http_code}" -X PUT "$BOOKSTACK_URL/api/pages/$EXISTING_PAGE" \
               -H "Authorization: Token $API_ID:$API_SECRET" \
               -H "Content-Type: application/json" \
-              -d "{
-                \"name\": \"${{ github.event.issue.title }}\",
-                \"html\": \"$ESCAPED_CONTENT\"
-              }" && echo "✅ Страница обновлена" || echo "❌ Ошибка при обновлении"
+              -H "Accept: application/json" \
+              -d "$JSON_DATA")
+            
+            HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+            BODY=$(echo "$RESPONSE" | sed '$d')
+            
+            echo "HTTP Code: $HTTP_CODE"
+            echo "Response: $BODY"
+            
+            if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+              echo "✅ Страница обновлена"
+            else
+              echo "❌ Ошибка при обновлении страницы"
+              exit 1
+            fi
           fi
